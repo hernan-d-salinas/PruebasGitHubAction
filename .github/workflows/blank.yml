@@ -1,0 +1,103 @@
+name: Autograde Labs
+
+on:
+  pull_request:
+    paths:
+      - "estudiantes/**/lab*.ipynb"
+      - "autograde/**"
+      - ".github/workflows/test.yml"
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.build.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch base branch
+        run: |
+          git fetch origin ${{ github.base_ref }} --depth=1
+
+      - id: build
+        name: Build matrix from changed notebooks
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { execSync } = require("child_process");
+
+            // files changed in PR
+            let out = execSync(`git diff --name-only FETCH_HEAD...${{ github.sha }}`, { encoding: "utf8" });
+            const files = out.split("\n").map(s => s.trim()).filter(Boolean);
+
+            const re = /^estudiantes\/[^/]+\/(lab\d+)\.ipynb$/;
+            const include = [];
+
+            for (const f of files) {
+              const m = f.match(re);
+              if (m) include.push({ lab: m[1], path: f });
+            }
+
+            core.setOutput("matrix", JSON.stringify({ include }));
+
+  grade:
+    needs: detect
+    if: ${{ fromJson(needs.detect.outputs.matrix).include[0] != null }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.detect.outputs.matrix) }}
+
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install -U pip
+          pip install nbformat
+
+      - name: Run autograder
+        run: |
+          python autograde/grade.py --lab ${{ matrix.lab }} --paths "${{ matrix.path }}" --out grades_${{ matrix.lab }}.json
+
+      - name: Comment results on PR
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const f = `grades_${{ matrix.lab }}.json`;
+            let body = `## 🧪 Autograde ${{ matrix.lab }}\n`;
+            if (!fs.existsSync(f)) {
+              body += "\nNo pude generar el JSON de calificación.\n";
+            } else {
+              const g = JSON.parse(fs.readFileSync(f,'utf8'));
+              for (const r of g.results) {
+                body += `\n### ${r.student}\n- File: \`${r.path}\`\n- Status: **${r.status}**\n`;
+                if (r.errors?.length) body += `- Errors:\n` + r.errors.map(e=>`  - ${e}`).join("\n") + "\n";
+                if (r.warnings?.length) body += `- Warnings:\n` + r.warnings.map(w=>`  - ${w}`).join("\n") + "\n";
+              }
+            }
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body
+            });
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: grades-${{ matrix.lab }}
+          path: grades_${{ matrix.lab }}.json
