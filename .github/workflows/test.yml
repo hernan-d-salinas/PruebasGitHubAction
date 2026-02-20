@@ -11,37 +11,34 @@ jobs:
   detect:
     runs-on: ubuntu-latest
     outputs:
-      matrix: ${{ steps.set-matrix.outputs.matrix }}
+      matrix: ${{ steps.set_matrix.outputs.matrix }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - id: set-matrix
+      - id: set_matrix
         name: Build matrix from changed notebooks
         shell: bash
         run: |
           CHANGED=$(git diff --name-only origin/${{ github.base_ref }}...${{ github.sha }} | grep -E '^estudiantes/.+/lab[0-9]+\.ipynb$' || true)
-          if [ -z "$CHANGED" ]; then
-            echo 'matrix={"include":[]}' >> $GITHUB_OUTPUT
-            exit 0
-          fi
+          echo "CHANGED<<EOF" >> $GITHUB_ENV
+          echo "$CHANGED" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
 
-          python - << 'PY'
+          python - << 'PY' >> $GITHUB_OUTPUT
 import json, os, re
-changed = os.environ["CHANGED"].strip().splitlines()
+changed = os.environ.get("CHANGED", "").strip().splitlines()
 items = []
 for p in changed:
     m = re.search(r"(lab\d+)\.ipynb$", p)
-    if not m: 
+    if not m:
         continue
-    lab = m.group(1)  # lab01, lab02...
+    lab = m.group(1)
     items.append({"lab": lab, "path": p})
-print(f"matrix={json.dumps({'include': items})}")
+
+print("matrix=" + json.dumps({"include": items}))
 PY
-          >> $GITHUB_OUTPUT
-        env:
-          CHANGED: ${{ steps.set-matrix.outputs.CHANGED }}
 
   grade:
     needs: detect
