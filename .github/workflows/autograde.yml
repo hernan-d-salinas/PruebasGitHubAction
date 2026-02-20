@@ -21,11 +21,9 @@ jobs:
           fetch-depth: 0
 
       - name: Fetch base branch
-        run: |
-          git fetch origin ${{ github.base_ref }} --depth=1
+        run: git fetch origin ${{ github.base_ref }} --depth=1
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
@@ -34,49 +32,36 @@ jobs:
           python -m pip install -U pip
           pip install nbformat
 
-      - name: Detect changed notebooks
-        id: changed
-        shell: bash
-        run: |
-          CHANGED=$(git diff --name-only FETCH_HEAD...${{ github.sha }} | grep -E '^estudiantes/.+/lab[0-9]+\.ipynb$' || true)
-          echo "changed<<EOF" >> $GITHUB_OUTPUT
-          echo "$CHANGED" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
-
-      - name: Run autograder for each changed notebook
-        if: ${{ steps.changed.outputs.changed != '' }}
+      - name: Run autograder on changed notebooks
         shell: bash
         run: |
           set -e
-          echo "${{ steps.changed.outputs.changed }}" > changed.txt
-          rm -f grades_all.json
+
+          # notebooks changed in this PR
+          CHANGED=$(git diff --name-only FETCH_HEAD...${{ github.sha }} | grep -E '^estudiantes/.+/lab[0-9]+\.ipynb$' || true)
+
+          # always create a grades file (even if empty)
           echo '{"results":[]}' > grades_all.json
+
+          if [ -z "$CHANGED" ]; then
+            echo "No changed notebooks detected."
+            exit 0
+          fi
+
+          echo "$CHANGED" > changed.txt
+          FAIL=0
 
           while IFS= read -r nb; do
             [ -z "$nb" ] && continue
-            lab=$(basename "$nb" .ipynb)   # lab01, lab02...
-            echo "Grading $nb (lab=$lab)"
-            python autograde/grade.py --lab "$lab" --paths "$nb" --out grade_one.json || true
+            lab=$(basename "$nb" .ipynb)   # lab01, lab02, ...
 
-            python - << 'PY'
-import json
-allf="grades_all.json"
-onef="grade_one.json"
-a=json.load(open(allf,"r",encoding="utf-8"))
-o=json.load(open(onef,"r",encoding="utf-8"))
-a["results"].extend(o.get("results",[]))
-json.dump(a, open(allf,"w",encoding="utf-8"), indent=2, ensure_ascii=False)
-PY
+            echo "Grading: $nb (lab=$lab)"
+            python autograde/grade.py --lab "$lab" --paths "$nb" --out grade_one.json || FAIL=1
+
+            python -c "import json; a=json.load(open('grades_all.json','r',encoding='utf-8')); o=json.load(open('grade_one.json','r',encoding='utf-8')); a['results'].extend(o.get('results',[])); json.dump(a, open('grades_all.json','w',encoding='utf-8'), indent=2, ensure_ascii=False)"
           done < changed.txt
 
-          # Falla el job si alguno fue FAIL
-          python - << 'PY'
-import json, sys
-g=json.load(open("grades_all.json","r",encoding="utf-8"))
-fails=[r for r in g["results"] if r.get("status")=="FAIL"]
-print("Total:", len(g["results"]), "FAIL:", len(fails))
-sys.exit(1 if fails else 0)
-PY
+          exit $FAIL
 
       - name: Comment results on PR
         if: always()
@@ -85,16 +70,22 @@ PY
           script: |
             const fs = require("fs");
             let body = "## 🧪 Autograde\n";
+
             if (!fs.existsSync("grades_all.json")) {
-              body += "\nNo se generó `grades_all.json` (posible: PR no cambió notebooks, o falló antes).\n";
+              body += "\nNo se generó `grades_all.json`.\n";
             } else {
               const g = JSON.parse(fs.readFileSync("grades_all.json", "utf8"));
-              for (const r of g.results) {
-                body += `\n### ${r.student} — ${r.lab}\n- File: \`${r.path}\`\n- Status: **${r.status}**\n`;
-                if (r.errors?.length) body += `- Errors:\n` + r.errors.map(e=>`  - ${e}`).join("\n") + "\n";
-                if (r.warnings?.length) body += `- Warnings:\n` + r.warnings.map(w=>`  - ${w}`).join("\n") + "\n";
+              if (!g.results.length) {
+                body += "\nNo hubo notebooks evaluados (PR no cambió `estudiantes/**/labXX.ipynb`).\n";
+              } else {
+                for (const r of g.results) {
+                  body += `\n### ${r.student} — ${r.lab}\n- File: \`${r.path}\`\n- Status: **${r.status}**\n`;
+                  if (r.errors?.length) body += `- Errors:\n` + r.errors.map(e=>`  - ${e}`).join("\n") + "\n";
+                  if (r.warnings?.length) body += `- Warnings:\n` + r.warnings.map(w=>`  - ${w}`).join("\n") + "\n";
+                }
               }
             }
+
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
