@@ -5,40 +5,42 @@ on:
     paths:
       - "estudiantes/**/lab*.ipynb"
       - "autograde/**"
-      - ".github/workflows/autograde.yml"
+      - ".github/workflows/test.yml"
 
 jobs:
   detect:
     runs-on: ubuntu-latest
     outputs:
-      matrix: ${{ steps.set_matrix.outputs.matrix }}
+      matrix: ${{ steps.build.outputs.matrix }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - id: set_matrix
-        name: Build matrix from changed notebooks
-        shell: bash
+      - name: Fetch base branch
         run: |
-          CHANGED=$(git diff --name-only origin/${{ github.base_ref }}...${{ github.sha }} | grep -E '^estudiantes/.+/lab[0-9]+\.ipynb$' || true)
-          echo "CHANGED<<EOF" >> $GITHUB_ENV
-          echo "$CHANGED" >> $GITHUB_ENV
-          echo "EOF" >> $GITHUB_ENV
+          git fetch origin ${{ github.base_ref }} --depth=1
 
-          python - << 'PY' >> $GITHUB_OUTPUT
-import json, os, re
-changed = os.environ.get("CHANGED", "").strip().splitlines()
-items = []
-for p in changed:
-    m = re.search(r"(lab\d+)\.ipynb$", p)
-    if not m:
-        continue
-    lab = m.group(1)
-    items.append({"lab": lab, "path": p})
+      - id: build
+        name: Build matrix from changed notebooks
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { execSync } = require("child_process");
 
-print("matrix=" + json.dumps({"include": items}))
-PY
+            // files changed in PR
+            let out = execSync(`git diff --name-only FETCH_HEAD...${{ github.sha }}`, { encoding: "utf8" });
+            const files = out.split("\n").map(s => s.trim()).filter(Boolean);
+
+            const re = /^estudiantes\/[^/]+\/(lab\d+)\.ipynb$/;
+            const include = [];
+
+            for (const f of files) {
+              const m = f.match(re);
+              if (m) include.push({ lab: m[1], path: f });
+            }
+
+            core.setOutput("matrix", JSON.stringify({ include }));
 
   grade:
     needs: detect
