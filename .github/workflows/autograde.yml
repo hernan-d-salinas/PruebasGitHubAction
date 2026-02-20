@@ -1,0 +1,110 @@
+name: Autograde Labs
+
+on:
+  pull_request:
+    paths:
+      - "estudiantes/**/lab*.ipynb"
+      - "autograde/**"
+      - ".github/workflows/autograde.yml"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  autograde:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch base branch
+        run: |
+          git fetch origin ${{ github.base_ref }} --depth=1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install -U pip
+          pip install nbformat
+
+      - name: Detect changed notebooks
+        id: changed
+        shell: bash
+        run: |
+          CHANGED=$(git diff --name-only FETCH_HEAD...${{ github.sha }} | grep -E '^estudiantes/.+/lab[0-9]+\.ipynb$' || true)
+          echo "changed<<EOF" >> $GITHUB_OUTPUT
+          echo "$CHANGED" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Run autograder for each changed notebook
+        if: ${{ steps.changed.outputs.changed != '' }}
+        shell: bash
+        run: |
+          set -e
+          echo "${{ steps.changed.outputs.changed }}" > changed.txt
+          rm -f grades_all.json
+          echo '{"results":[]}' > grades_all.json
+
+          while IFS= read -r nb; do
+            [ -z "$nb" ] && continue
+            lab=$(basename "$nb" .ipynb)   # lab01, lab02...
+            echo "Grading $nb (lab=$lab)"
+            python autograde/grade.py --lab "$lab" --paths "$nb" --out grade_one.json || true
+
+            python - << 'PY'
+import json
+allf="grades_all.json"
+onef="grade_one.json"
+a=json.load(open(allf,"r",encoding="utf-8"))
+o=json.load(open(onef,"r",encoding="utf-8"))
+a["results"].extend(o.get("results",[]))
+json.dump(a, open(allf,"w",encoding="utf-8"), indent=2, ensure_ascii=False)
+PY
+          done < changed.txt
+
+          # Falla el job si alguno fue FAIL
+          python - << 'PY'
+import json, sys
+g=json.load(open("grades_all.json","r",encoding="utf-8"))
+fails=[r for r in g["results"] if r.get("status")=="FAIL"]
+print("Total:", len(g["results"]), "FAIL:", len(fails))
+sys.exit(1 if fails else 0)
+PY
+
+      - name: Comment results on PR
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require("fs");
+            let body = "## 🧪 Autograde\n";
+            if (!fs.existsSync("grades_all.json")) {
+              body += "\nNo se generó `grades_all.json` (posible: PR no cambió notebooks, o falló antes).\n";
+            } else {
+              const g = JSON.parse(fs.readFileSync("grades_all.json", "utf8"));
+              for (const r of g.results) {
+                body += `\n### ${r.student} — ${r.lab}\n- File: \`${r.path}\`\n- Status: **${r.status}**\n`;
+                if (r.errors?.length) body += `- Errors:\n` + r.errors.map(e=>`  - ${e}`).join("\n") + "\n";
+                if (r.warnings?.length) body += `- Warnings:\n` + r.warnings.map(w=>`  - ${w}`).join("\n") + "\n";
+              }
+            }
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body
+            });
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: grades
+          path: grades_all.json
